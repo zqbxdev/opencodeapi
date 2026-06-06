@@ -1,0 +1,14 @@
+{
+  "name": "openapi",
+  "version": "1.0.0",
+  "description": "OpenCode Free Models API Proxy - extract from 9router",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0"
+  }
+}
