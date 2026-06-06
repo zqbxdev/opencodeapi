@@ -13,6 +13,7 @@ Docker Hub 镜像：<https://hub.docker.com/repository/docker/zqbxdev/opencodeap
 - **1 小时内存缓存**：减少模型列表请求开销，提升接口响应速度。
 - **静态兜底模型列表**：当上游模型接口不可用时仍可返回可用模型列表。
 - **协议适配**：对部分非 OpenAI Chat Completions 协议模型进行请求/响应格式转换。
+- **工具调用支持 (Tool Calling)**：支持标准的 OpenAI `tools` 和 `tool_choice` 参数，在 Anthropic 等不同协议模型间实现请求和流式响应的双向转换，能够自动映射工具参数并转换流式 tool_calls 输出。
 - **Abort 级联中止**：客户端断开连接后主动中止上游 fetch，减少僵尸连接与带宽浪费。
 - **Docker 部署**：提供轻量 `Dockerfile` 与 Docker Hub 镜像发布工作流。
 - **Tag 触发发布**：推送 Git tag 后自动构建并推送 Docker 镜像到 Docker Hub。
@@ -55,7 +56,7 @@ docker run -d \
   --name opencodeapi \
   --restart unless-stopped \
   -p 4097:4097 \
-  zqbxdev/opencodeapi:v1.0.0
+  zqbxdev/opencodeapi:v1.0.1
 ```
 
 ## API 使用示例
@@ -108,6 +109,75 @@ curl http://localhost:4097/v1/chat/completions \
     ],
     "stream": false
   }'
+```
+
+### 工具调用 (Tool Calling) 示例
+
+```bash
+curl http://localhost:4097/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "big-pickle",
+    "messages": [
+      {"role": "user", "content": "今天巴黎的天气怎么样？"}
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "获取指定位置的当前天气情况",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "location": {
+                "type": "string",
+                "description": "城市名称，例如巴黎"
+              }
+            },
+            "required": ["location"]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto"
+  }'
+```
+
+期望返回的响应中将包含 `tool_calls` 结构：
+
+```json
+{
+  "id": "chatcmpl-12345",
+  "object": "chat.completion",
+  "created": 1717689600,
+  "model": "claude-3-opus-20240229",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "toolu_xyz",
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": "{\"location\":\"巴黎\"}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 85,
+    "completion_tokens": 40,
+    "total_tokens": 125
+  }
+}
 ```
 
 ### 使用示例脚本

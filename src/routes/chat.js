@@ -1,11 +1,12 @@
 import { Router } from "express";
-import { executeOpenCode, parseStreamChunk, convertAnthropicResponse } from "../executor.js";
+import { executeOpenCode, parseStreamChunk, convertAnthropicResponse, createStreamState } from "../executor.js";
 import { getFreeModels, resolveEndpoint } from "../config.js";
 
 const router = Router();
 
 router.post("/v1/chat/completions", async (req, res) => {
-  const { model, messages, stream = false } = req.body;
+  const requestBody = req.body;
+  const { model, messages, stream = false } = requestBody;
 
   if (!model) {
     return res.status(400).json({ error: "model is required" });
@@ -27,13 +28,13 @@ router.post("/v1/chat/completions", async (req, res) => {
   const isMessagesEndpoint = resolveEndpoint(model).includes("/messages");
 
   if (stream) {
-    return handleStreaming(req, res, model, messages, isMessagesEndpoint);
+    return handleStreaming(req, res, { ...requestBody, stream: true }, isMessagesEndpoint);
   }
 
-  return handleNonStreaming(req, res, model, messages, isMessagesEndpoint);
+  return handleNonStreaming(req, res, { ...requestBody, stream: false }, isMessagesEndpoint);
 });
 
-async function handleStreaming(req, res, model, messages, isMessagesEndpoint) {
+async function handleStreaming(req, res, requestBody, isMessagesEndpoint) {
   const abortController = new AbortController();
 
   res.on("close", () => {
@@ -42,9 +43,7 @@ async function handleStreaming(req, res, model, messages, isMessagesEndpoint) {
 
   try {
     const upstream = await executeOpenCode({
-      model,
-      messages,
-      stream: true,
+      requestBody,
       signal: abortController.signal,
     });
 
@@ -57,27 +56,50 @@ async function handleStreaming(req, res, model, messages, isMessagesEndpoint) {
 
     const reader = upstream.body.getReader();
     const decoder = new TextDecoder();
+    const streamState = isMessagesEndpoint ? createStreamState() : undefined;
+    let buffer = "";
+    let doneSent = false;
+
+    const sendDone = () => {
+      if (doneSent) return;
+      res.write("data: [DONE]\n\n");
+      doneSent = true;
+    };
 
     while (true) {
-      if (abortController.signal.aborted) break;
+      if (abortController.signal.aborted || doneSent) break;
       const { done, value } = await reader.read();
       if (done) break;
 
-      const text = decoder.decode(value, { stream: true });
-      const lines = text.split("\n");
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
       for (const raw of lines) {
         if (!raw.trim()) continue;
-        const chunk = parseStreamChunk(raw, isMessagesEndpoint);
+        const chunk = parseStreamChunk(raw, isMessagesEndpoint, streamState);
         if (!chunk) continue;
         if (chunk.done) {
-          res.write("data: [DONE]\n\n");
-          continue;
+          sendDone();
+          break;
         }
         res.write(`data: ${JSON.stringify(chunk.data)}\n\n`);
       }
     }
 
-    res.write("data: [DONE]\n\n");
+    if (!doneSent) {
+      const remaining = buffer + decoder.decode();
+      if (remaining.trim()) {
+        const chunk = parseStreamChunk(remaining, isMessagesEndpoint, streamState);
+        if (chunk?.done) {
+          sendDone();
+        } else if (chunk) {
+          res.write(`data: ${JSON.stringify(chunk.data)}\n\n`);
+        }
+      }
+    }
+
+    sendDone();
     res.end();
   } catch (err) {
     if (err.name === "AbortError") return;
@@ -89,12 +111,10 @@ async function handleStreaming(req, res, model, messages, isMessagesEndpoint) {
   }
 }
 
-async function handleNonStreaming(req, res, model, messages, isMessagesEndpoint) {
+async function handleNonStreaming(req, res, requestBody, isMessagesEndpoint) {
   try {
     const response = await executeOpenCode({
-      model,
-      messages,
-      stream: false,
+      requestBody,
     });
 
     const body = await response.json();

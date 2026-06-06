@@ -158,7 +158,7 @@ OpenCode 后端可能对不同模型使用不同接口协议。`opencodeapi` 的
 POST https://opencode.ai/zen/v1/chat/completions
 ```
 
-该路径与 OpenAI Chat Completions 结构接近，因此主要做透传与错误规范化。
+该路径与 OpenAI Chat Completions 结构接近。在此路径下，系统执行透传处理，将包含 `tools`、`tool_choice`、`temperature`、`max_tokens` 等参数在内的完整请求体原样保留并透传至上游。
 
 ### 6.2 Anthropic Messages 路径
 
@@ -170,21 +170,58 @@ POST https://opencode.ai/zen/v1/messages
 
 这类模型需要额外转换。
 
-请求转换重点：
+#### 6.2.1 请求参数转换
 
-- 将 OpenAI `messages` 转为 Anthropic `messages`。
-- 处理 `system` 消息位置差异。
-- 将复杂 content block 合并为文本。
-- 自动补充 `max_tokens`。
+在发起上游请求前，系统会调用 `buildRequestBody` 自动识别终端类型。如果是 Messages 终端，将调用 `buildAnthropicRequestBody` 对请求进行转换：
 
-流式响应转换重点：
+1. **请求体保留与透传**：继承原有请求体中无关转换的额外参数，确保透传无遗漏。
+2. **工具格式转换 (OpenAI Tools 到 Anthropic Tools)**：
+   * 将 OpenAI 的 `tools` 数组（或旧版 `functions`）中的函数定义解构，映射为 Anthropic 所需的格式。
+   * 将 OpenAI 的 `parameters` 属性重命名为 Anthropic 的 `input_schema`。
+   * 当 `tool_choice` 或 `function_call` 设置为 `"none"` 时，禁用工具调用，上游请求将不携带任何 tools 参数。
+3. **工具选择逻辑转换 (tool_choice 转换)**：
+   * OpenAI 的 `"auto"` 映射为 Anthropic 的 `{ "type": "auto" }`。
+   * OpenAI 的 `"required"` 映射为 Anthropic 的 `{ "type": "any" }`。
+   * 指定特定工具调用时（如 `{ type: "function", function: { name: "xxx" } }` 或 `{ name: "xxx" }`），映射为 Anthropic 的 `{ "type": "tool", "name": "xxx" }`。
+4. **消息历史与工具结果转换**：
+   * 将 `system` 消息从 `messages` 数组中提取并合并，放入外层的 `system` 字段。
+   * 合并相邻且角色相同的消息。
+   * 将 `role: "tool"` 的 OpenAI 工具执行结果转换为 Anthropic 规范下的 `role: "user"`，并且其 content 包含 `type: "tool_result"` 节点，同时通过 `tool_use_id` 关联。
+   * 将包含 `tool_calls` 的 `role: "assistant"` 消息转换为 content 包含 `type: "tool_use"` 节点的 Anthropic 格式，将 JSON 字符串参数解析为结构化 Object。
+   * 为确保 ID 安全，对所有工具 ID 执行 `sanitizeToolId` 格式化，限制字符范围。
 
-| Anthropic SSE 事件 | OpenAI SSE 转换 |
-|---|---|
-| `message_start` | 初始化 `chat.completion.chunk` |
-| `content_block_delta` | 转成 `choices[0].delta.content` |
-| `message_delta` | 转成带 `finish_reason` 的 chunk |
-| `message_stop` | 输出 `data: [DONE]` |
+#### 6.2.2 响应结果转换 (非流式)
+
+当上游非流式请求返回时，系统使用 `convertAnthropicResponse` 将其转换为标准的 OpenAI 响应格式：
+* 将 Anthropic 返回的 `tool_use` 节点转换为 OpenAI 的 `choices[0].message.tool_calls`。
+* 重新将结构化 Object 序列化为 OpenAI 规范的 JSON 字符串参数。
+* 将停止原因映射为 OpenAI 规范：如 `tool_use` 映射为 `tool_calls`，`end_turn`/`stop_sequence` 映射为 `stop`，`max_tokens` 映射为 `length`。
+
+#### 6.2.3 流式响应转换 (SSE)
+
+在流式响应中，上游发出的 Anthropic 细粒度事件需要被重组为 OpenAI 的 `chat.completion.chunk`。为此系统引入了 `createStreamState()` 创建请求级别的共享状态实例，包含：
+* `messageId`: 当前请求的唯一消息 ID，确保所有流式块使用同一 ID。
+* `model`: 当前响应模型名称。
+* `toolCalls`: 保存工具调用索引与标识的 Map 结构。
+* `nextToolCallIndex`: 从 0 开始的递增计数器。
+
+具体事件映射与状态维护如下：
+* **`message_start`**: 提取消息 ID 和模型名称，初始化第一帧。
+* **`content_block_start`**:
+  * 如果是 `type: "tool_use"`，利用 `nextToolCallIndex` 分配唯一的递增索引（从 0 开始），并将此事件在 Anthropic 中的块 `index` 关联绑定至该唯一索引。这确保了即使 Anthropic 块索引不连续，OpenAI 侧的 `tool_calls` 索引也从 0 开始。
+  * 输出包含工具 `id` 和 `name` 的初始 chunk。
+  * 如果是 `type: "text"`，输出文本初始帧。
+* **`content_block_delta`**:
+  * 如果是 `type: "input_json_delta"`，通过 `streamState.toolCalls` 检索该块对应的唯一工具索引，并以 `delta.tool_calls[0].function.arguments` 的增量形式将参数 JSON 片段输出。
+  * 如果是 `type: "text_delta"`，输出增量文本。
+* **`message_delta`**: 映射停止原因并将其填入 `finish_reason` 属性中输出。
+* **`message_stop`**: 返回流结束信号。
+
+#### 6.2.4 重复 DONE 信号防护
+
+在流处理循环（`routes/chat.js`）中，系统维护了 `doneSent` 状态：
+* 当检测到 `chunk.done` 时调用 `sendDone()` 方法，它会先校验并设置 `doneSent` 为 true，随后仅写入一次 `data: [DONE]\n\n`。
+* 之后的数据读取和任何兜底逻辑都会跳过，避免在异常退出或流尾部重复输出 `[DONE]` 信号。
 
 ---
 
@@ -409,9 +446,10 @@ NODE_ENV=production
 
 1. **保持 workflow secrets 最小权限**：Docker Hub token 建议只用于当前镜像仓库的 Read/Write。
 2. **发布版本使用语义化 tag**：例如 `v1.0.0`、`v1.0.1`。
-3. **修改上游协议适配时必须跑压测**：至少运行 `bun run test-stress.js`。
+3. **修改上游协议适配时必须跑压测与单元测试**：至少运行 `bun run test-stress.js` 并执行 `bun test` 确保所有单元测试（包含 `tests/tool_calling.test.js`）完全通过。
 4. **新增特殊模型时更新过滤与协议映射**：如果模型不是标准 Chat Completions 协议，需要在 `executor.js` 中加入转换逻辑。
-5. **避免无意义高并发滥用上游公共通道**：服务适合自用与测试，不应用于批量刷量或商业转售。
+5. **发布与 Tag 管理**：推送新版本 tag 触发自动构建发布时，请确保文档已被正确更新，并使用递增版本号发布（如 `v1.0.1` ）。
+6. **避免无意义高并发滥用上游公共通道**：服务适合自用与测试，不应用于批量刷量或商业转售。
 
 ---
 
