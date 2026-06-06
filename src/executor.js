@@ -71,12 +71,12 @@ function buildAnthropicRequestBody(requestBody) {
     function_call,
     stop,
     max_tokens,
-    ...rest
+    max_completion_tokens,
   } = requestBody;
 
-  const body = { ...rest };
+  const body = pickAnthropicParams(requestBody);
   body.messages = mergeAdjacentMessages(convertAnthropicMessages(messages, body));
-  body.max_tokens = max_tokens ?? 4096;
+  body.max_tokens = max_tokens ?? max_completion_tokens ?? 4096;
 
   if (typeof stop !== "undefined") {
     body.stop_sequences = Array.isArray(stop) ? stop : [stop];
@@ -86,63 +86,95 @@ function buildAnthropicRequestBody(requestBody) {
   const anthropicTools = toolsDisabled ? [] : convertAnthropicTools(tools, functions);
   if (anthropicTools.length > 0) {
     body.tools = anthropicTools;
-  }
 
-  if (!toolsDisabled) {
-    const anthropicToolChoice = convertAnthropicToolChoice(tool_choice ?? function_call);
-    if (anthropicToolChoice) {
-      body.tool_choice = anthropicToolChoice;
+    if (!toolsDisabled) {
+      const anthropicToolChoice = convertAnthropicToolChoice(tool_choice ?? function_call);
+      if (anthropicToolChoice) {
+        body.tool_choice = anthropicToolChoice;
+      }
     }
   }
 
   return body;
 }
 
+function pickAnthropicParams(requestBody) {
+  const body = {};
+  for (const key of ["model", "stream", "temperature", "top_p", "top_k", "metadata"]) {
+    if (typeof requestBody[key] !== "undefined") {
+      body[key] = requestBody[key];
+    }
+  }
+  return body;
+}
+
 function convertAnthropicMessages(messages, body) {
   const systemParts = [];
   const converted = [];
+  const idContext = createToolIdContext();
 
-  for (const message of messages) {
+  messages.forEach((message, messageIndex) => {
     if (message.role === "system") {
       const systemText = contentToText(message.content);
       if (systemText) systemParts.push(systemText);
-      continue;
+      return;
     }
 
-    if (message.role === "tool") {
+    if (message.role === "tool" || message.role === "function") {
       converted.push({
         role: "user",
         content: [{
           type: "tool_result",
-          tool_use_id: sanitizeToolId(message.tool_call_id || message.id),
+          tool_use_id: resolveToolResultId(message, messageIndex, idContext),
           content: contentToText(message.content),
         }],
       });
-      continue;
+      return;
     }
 
-    if (message.role === "assistant" && Array.isArray(message.tool_calls)) {
+    if (message.role === "assistant" && (Array.isArray(message.tool_calls) || message.function_call)) {
       const content = [];
       const text = contentToText(message.content);
       if (text) content.push({ type: "text", text });
-      for (const toolCall of message.tool_calls) {
-        if (toolCall.type && toolCall.type !== "function") continue;
-        content.push({
-          type: "tool_use",
-          id: sanitizeToolId(toolCall.id),
-          name: toolCall.function?.name || toolCall.name,
-          input: parseToolArguments(toolCall.function?.arguments ?? toolCall.arguments),
+
+      if (Array.isArray(message.tool_calls)) {
+        message.tool_calls.forEach((toolCall, toolIndex) => {
+          if (toolCall.type && toolCall.type !== "function") return;
+          const name = toolCall.function?.name || toolCall.name;
+          const id = resolveAssistantToolUseId(toolCall.id, messageIndex, toolIndex, name, idContext);
+          content.push({
+            type: "tool_use",
+            id,
+            name,
+            input: parseToolArguments(toolCall.function?.arguments ?? toolCall.arguments),
+          });
         });
       }
+
+      if (message.function_call) {
+        const name = message.function_call.name;
+        const id = resolveAssistantToolUseId(message.function_call.id, messageIndex, 0, name, idContext);
+        content.push({
+          type: "tool_use",
+          id,
+          name,
+          input: parseToolArguments(message.function_call.arguments),
+        });
+      }
+
+      if (content.length === 0) {
+        content.push({ type: "text", text: " " });
+      }
+
       converted.push({ role: "assistant", content });
-      continue;
+      return;
     }
 
     converted.push({
       role: message.role === "assistant" ? "assistant" : "user",
-      content: convertMessageContent(message.content),
+      content: normalizeAnthropicContent(message.content, message.role),
     });
-  }
+  });
 
   if (systemParts.length > 0) {
     body.system = systemParts.join("\n");
@@ -177,6 +209,7 @@ function convertAnthropicToolChoice(toolChoice) {
   if (toolChoice === "auto") return { type: "auto" };
   if (toolChoice === "none") return null;
   if (toolChoice === "required") return { type: "any" };
+  if (typeof toolChoice === "string") return { type: "tool", name: toolChoice };
   if (typeof toolChoice === "object") {
     if (toolChoice.type === "function" && toolChoice.function?.name) {
       return { type: "tool", name: toolChoice.function.name };
@@ -190,12 +223,29 @@ function convertAnthropicToolChoice(toolChoice) {
 
 function convertMessageContent(content) {
   if (Array.isArray(content)) {
-    return content.map((part) => {
-      if (part.type === "text") return { type: "text", text: part.text || "" };
-      return part;
+    return content.flatMap((part) => {
+      if (typeof part === "string") {
+        return part ? [{ type: "text", text: part }] : [];
+      }
+      if (part?.type === "text") {
+        return part.text ? [{ type: "text", text: part.text }] : [];
+      }
+      return part ? [part] : [];
     });
   }
   return content ?? "";
+}
+
+function normalizeAnthropicContent(content, role) {
+  const converted = convertMessageContent(content);
+  if (Array.isArray(converted)) {
+    const nonEmpty = converted.filter((part) => part?.type !== "text" || part.text);
+    if (nonEmpty.length > 0) return nonEmpty;
+  } else if (converted) {
+    return converted;
+  }
+
+  return role === "assistant" ? [{ type: "text", text: " " }] : [{ type: "text", text: " " }];
 }
 
 function contentToText(content) {
@@ -219,8 +269,90 @@ function parseToolArguments(args) {
   }
 }
 
+function createToolIdContext() {
+  return {
+    usedIds: new Set(),
+    pendingById: new Map(),
+    pendingByName: new Map(),
+  };
+}
+
+function resolveAssistantToolUseId(sourceId, messageIndex, toolIndex, name, context) {
+  const originalId = sourceId ? String(sourceId) : null;
+  const fallback = `toolu_missing_${messageIndex}_${toolIndex}_${name || "tool"}`;
+  const id = uniqueToolId(sanitizeToolId(originalId || fallback), context);
+  rememberPendingToolUse(name, id, context, originalId);
+  return id;
+}
+
+function resolveToolResultId(message, messageIndex, context) {
+  const sourceId = message.tool_call_id || message.id;
+  const resolvedById = sourceId ? shiftPendingToolUseById(sourceId, context) : null;
+  if (resolvedById) return resolvedById;
+
+  const resolvedByName = message.name ? shiftPendingToolUseByName(message.name, context) : null;
+  if (resolvedByName) return resolvedByName;
+
+  if (sourceId) return sanitizeToolId(sourceId);
+  if (message.name) return sanitizeToolId(message.name);
+  return sanitizeToolId(`toolu_missing_${messageIndex}_0_result`);
+}
+
+function rememberPendingToolUse(name, id, context, sourceId) {
+  const idKeys = new Set([id]);
+  if (sourceId) {
+    idKeys.add(String(sourceId));
+    idKeys.add(sanitizeToolId(sourceId));
+  }
+
+  for (const key of idKeys) {
+    pushPending(context.pendingById, key, id);
+  }
+
+  if (name) {
+    pushPending(context.pendingByName, sanitizeToolId(name), id);
+  }
+}
+
+function pushPending(map, key, id) {
+  const pending = map.get(key) || [];
+  pending.push(id);
+  map.set(key, pending);
+}
+
+function shiftPendingToolUseById(sourceId, context) {
+  const keys = [String(sourceId), sanitizeToolId(sourceId)];
+  for (const key of keys) {
+    const id = shiftPending(context.pendingById, key);
+    if (id) return id;
+  }
+  return null;
+}
+
+function shiftPendingToolUseByName(name, context) {
+  return shiftPending(context.pendingByName, sanitizeToolId(name));
+}
+
+function shiftPending(map, key) {
+  const pending = map.get(key);
+  if (!pending?.length) return null;
+  const id = pending.shift();
+  if (pending.length === 0) map.delete(key);
+  return id;
+}
+
+function uniqueToolId(id, context) {
+  let candidate = id;
+  let suffix = 1;
+  while (context.usedIds.has(candidate)) {
+    candidate = `${id}_${suffix++}`;
+  }
+  context.usedIds.add(candidate);
+  return candidate;
+}
+
 function sanitizeToolId(id) {
-  return String(id || `toolu_${Date.now()}`).replace(/[^a-zA-Z0-9_-]/g, "_");
+  return String(id || "toolu_missing").replace(/[^a-zA-Z0-9_-]/g, "_");
 }
 
 function mergeAdjacentMessages(messages) {
@@ -405,7 +537,7 @@ export function convertAnthropicResponse(body) {
     }));
   const message = {
     role: "assistant",
-    content: text,
+    content: (text === "" && toolCalls.length > 0) ? null : text,
   };
 
   if (toolCalls.length > 0) {
