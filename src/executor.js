@@ -379,6 +379,117 @@ function mergeContent(left, right) {
   return [left, right].filter(Boolean).join("\n");
 }
 
+const SUPPRESSED_CONTENT_BLOCK_TYPES = new Set([
+  "thinking",
+  "redacted_thinking",
+  "reasoning",
+  "signature",
+]);
+
+const SUPPRESSED_DELTA_TYPES = new Set([
+  "thinking_delta",
+  "redacted_thinking_delta",
+  "reasoning_delta",
+  "signature_delta",
+]);
+
+function isSuppressedContentBlock(block) {
+  return SUPPRESSED_CONTENT_BLOCK_TYPES.has(block?.type);
+}
+
+function isSuppressedDelta(delta) {
+  return SUPPRESSED_DELTA_TYPES.has(delta?.type)
+    || typeof delta?.thinking === "string"
+    || typeof delta?.reasoning === "string"
+    || typeof delta?.reasoning_content === "string"
+    || typeof delta?.signature === "string";
+}
+
+function stripTaggedThinking(text) {
+  if (!text) return text || "";
+  return text
+    .replace(/<\s*(think|thinking)\b[^>]*>[\s\S]*?<\s*\/\s*\1\s*>/gi, "")
+    .replace(/<\s*(think|thinking)\b[^>]*>[\s\S]*$/gi, "");
+}
+
+function createThinkingTagFilter() {
+  return {
+    pending: "",
+    suppressing: false,
+  };
+}
+
+function stripTaggedThinkingDelta(text, filter = createThinkingTagFilter()) {
+  if (!text) return "";
+
+  const input = filter.pending + text;
+  filter.pending = "";
+  let output = "";
+  let index = 0;
+
+  while (index < input.length) {
+    const rest = input.slice(index);
+
+    if (filter.suppressing) {
+      const close = rest.match(/^<\s*\/\s*(think|thinking)\s*>/i);
+      if (close) {
+        filter.suppressing = false;
+        index += close[0].length;
+        continue;
+      }
+
+      const nextTag = rest.indexOf("<");
+      if (nextTag === -1) {
+        index = input.length;
+        continue;
+      }
+
+      if (nextTag > 0) {
+        index += nextTag;
+        continue;
+      }
+
+      if (isPotentialThinkingClosePrefix(rest)) {
+        filter.pending = rest;
+        break;
+      }
+
+      index += 1;
+      continue;
+    }
+
+    const open = rest.match(/^<\s*(think|thinking)\b[^>]*>/i);
+    if (open) {
+      filter.suppressing = true;
+      index += open[0].length;
+      continue;
+    }
+
+    if (rest[0] === "<" && isPotentialThinkingOpenPrefix(rest)) {
+      filter.pending = rest;
+      break;
+    }
+
+    output += rest[0];
+    index += 1;
+  }
+
+  return output;
+}
+
+function isPotentialThinkingOpenPrefix(value) {
+  return isPotentialTagPrefix(value, ["<think", "<thinking"]);
+}
+
+function isPotentialThinkingClosePrefix(value) {
+  return isPotentialTagPrefix(value, ["</think", "</thinking"]);
+}
+
+function isPotentialTagPrefix(value, targets) {
+  const normalized = value.toLowerCase().replace(/^<\s*/, "<").replace(/^<\/\s*/, "</");
+  return targets.some((target) => target.startsWith(normalized));
+}
+
 export function mapAnthropicStopReason(stopReason) {
   switch (stopReason) {
     case "tool_use":
@@ -415,7 +526,13 @@ export function parseStreamChunk(line, isMessagesEndpoint, streamState) {
       return convertAnthropicChunk(parsed, streamState);
     }
 
-    // Already OpenAI format - pass through
+    if (streamState && Array.isArray(parsed.choices)) {
+      for (const choice of parsed.choices) {
+        if (typeof choice?.delta?.content === "string") {
+          choice.delta.content = stripTaggedThinkingDelta(choice.delta.content, streamState.thinkingTagFilter);
+        }
+      }
+    }
     return { data: parsed, done: false };
   } catch {
     return null;
@@ -431,6 +548,7 @@ export function createStreamState() {
     model: "",
     toolCalls: new Map(),
     nextToolCallIndex: 0,
+    thinkingTagFilter: createThinkingTagFilter(),
   };
 }
 
@@ -476,8 +594,13 @@ export function convertAnthropicChunk(parsed, streamState = createStreamState())
         });
       }
 
+      if (isSuppressedContentBlock(parsed.content_block)) {
+        return null;
+      }
+
       if (parsed.content_block?.type === "text") {
-        return chunk({ content: parsed.content_block.text || "" });
+        const content = stripTaggedThinkingDelta(parsed.content_block.text || "", streamState.thinkingTagFilter);
+        return content === "" ? null : chunk({ content });
       }
 
       return null;
@@ -496,8 +619,13 @@ export function convertAnthropicChunk(parsed, streamState = createStreamState())
         });
       }
 
+      if (isSuppressedDelta(parsed.delta)) {
+        return null;
+      }
+
       if (parsed.delta?.type === "text_delta" || typeof parsed.delta?.text === "string") {
-        return chunk({ content: parsed.delta?.text || "" });
+        const content = stripTaggedThinkingDelta(parsed.delta?.text || "", streamState.thinkingTagFilter);
+        return content === "" ? null : chunk({ content });
       }
 
       return null;
@@ -521,10 +649,10 @@ export function convertAnthropicChunk(parsed, streamState = createStreamState())
  */
 export function convertAnthropicResponse(body) {
   const contentBlocks = Array.isArray(body.content) ? body.content : [];
-  const text = contentBlocks
-    .filter((block) => block?.type === "text" && typeof block.text === "string")
-    .map((block) => block.text)
-    .join("");
+  const textBlocks = contentBlocks
+    .filter((block) => !isSuppressedContentBlock(block) && block?.type === "text" && typeof block.text === "string")
+    .map((block) => block.text);
+  const text = stripTaggedThinking(textBlocks.join(""));
   const toolCalls = contentBlocks
     .filter((block) => block?.type === "tool_use")
     .map((block) => ({
