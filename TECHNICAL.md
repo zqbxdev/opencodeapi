@@ -1,104 +1,468 @@
 # OpenCodeAPI 技术架构文档
 
-本文档详细介绍了 `opencodeapi` 代理服务的架构设计、API 逆向分析实现、协议格式转换机制，以及高并发网络连接的中断与回收机制。
+本文档面向维护者，说明 `opencodeapi` 的运行架构、上游协议适配、模型发现缓存、连接中止传播，以及 Docker/GitHub Actions 发布链路。
 
 ---
 
-## 1. 架构概览
+## 1. 系统定位
 
-`opencodeapi` 作为一个中转反向代理，采用 Node.js/Express 构建，使用 Bun 运行时执行。其核心职责是将标准的 OpenAI 聊天补全请求翻译成 OpenCode 云端接口能够理解的格式，并高效地传输流式或非流式响应。
+`opencodeapi` 是一个 OpenAI-compatible 反向代理服务。它对外暴露标准 OpenAI 风格接口，对内调用 OpenCode 的云端 Zen API，并负责在不同上游协议之间做请求与响应转换。
 
-### 模块结构
+核心目标：
+
+1. 让客户端以统一的 OpenAI API 方式访问 OpenCode 免费模型。
+2. 自动发现上游新增免费模型，减少手动维护成本。
+3. 支持 SSE 流式转发，并在客户端断开后及时释放上游连接。
+4. 提供容器化部署与 tag-triggered 镜像发布流程。
+
+---
+
+## 2. 项目结构
+
 ```text
 opencodeapi/
-├── index.js                  # 入口服务，加载 Express 并初始化路由和全局状态
+├── .github/
+│   └── workflows/
+│       └── docker-publish.yml   # Git tag 触发 Docker 镜像构建与推送
+├── Dockerfile                   # Bun Alpine 生产镜像构建文件
+├── README.md                    # 使用文档
+├── TECHNICAL.md                 # 技术文档
+├── example.js                   # SSE 调用示例
+├── index.js                     # Express 服务入口
+├── package.json                 # 项目依赖与脚本
+├── test-stress.js               # 并发压测脚本
 └── src/
-    ├── config.js             # 配置中心，包含云端/本地模型定义、时效缓存、终端 Header 定义
-    ├── executor.js           # 逆向网络执行器，负责云端发起调用、协议转换 (OpenAI <-> Anthropic)
+    ├── config.js                # 上游地址、Header、模型发现、缓存与 fallback
+    ├── executor.js              # 上游请求执行器与协议转换层
     └── routes/
-        ├── models.js         # GET /v1/models 路由，提供动态的模型列表获取
-        └── chat.js           # POST /v1/chat/completions 路由，处理高并发的流式与非流式代理
+        ├── chat.js              # POST /v1/chat/completions
+        └── models.js            # GET /v1/models
 ```
 
 ---
 
-## 2. API 逆向与凭证伪装
+## 3. 请求链路
 
-OpenCode 官方通过在桌面客户端（Desktop TUI / Plugin）中配置一组特定的免密公共通道，以满足用户基础功能的快速体验。`opencodeapi` 提取并模拟了该通道的所有请求特征：
-
-* **Base URL**：所有的接口访问均指向 `https://opencode.ai`。
-* **认证授权 (Authorization)**：云端接受一个公共标识令牌 `Bearer public`。
-* **设备伪装 (Device Impersonation)**：必须携带 `x-opencode-client: desktop` 标头，告知云端这是一个官方的终端客户端，以避免由于跨域或未知来源导致的拦截。
-* **数据流设定**：设置 `Accept: text/event-stream` 来维持持久连接。
-
----
-
-## 3. 协议适配与双向格式转换
-
-OpenCode 平台在后端接入了多种不同的底层推理引擎，不同接口支持的协议格式不同：
-1. **OpenAI Chat Completions 兼容路径**：`/zen/v1/chat/completions`。
-2. **Anthropic Messages 兼容路径**：`/zen/v1/messages` (目前如测试模型 `big-pickle` 使用该路径)。
-
-为了让客户端能够使用标准的 OpenAI 协议请求这两种类型的模型，`opencodeapi` 在 `src/executor.js` 中实现了全自动的协议翻译：
-
-### 3.1 请求格式转化 (Request Normalization)
-当检测到目标模型属于 Anthropic Messages 协议格式时，执行器会将 OpenAI 格式的请求体转化为符合 Anthropic 格式的 Payload：
-* **Role 映射**：将 OpenAI 消息中的 `system` 角色降级/合并为 `user`，因为 Anthropic 协议对系统提示词的位置有严格限制。
-* **内容格式转换**：如果输入消息 `content` 是复杂数组对象，自动提取所有文本类型块并用换行拼接为单一文本。
-* **强制参数**：自动附加必填项 `max_tokens: 4096` 以防报错。
-
-### 3.2 流式分块翻译 (Streaming Chunks Normalization)
-这是协议翻译中最复杂的环节。由于上游返回的 SSE（Server-Sent Events）事件结构大相径庭，执行器需要截获并重组分块：
-* **Anthropic 启动阶段 (`message_start`)**：转换为 OpenAI 首包特征（包含模型名称、创建时间戳并初始化 `choices[0].delta` 结构）。
-* **数据传输阶段 (`content_block_delta`)**：提取包含在 `delta.text` 中的增量文本，重组并输出 OpenAI 标准分块 `{"choices":[{"delta":{"content":"..."}}]}`。
-* **完成阶段 (`message_delta` / `message_stop`)**：捕获 Anthropic 的 `stop_reason`，翻译成 OpenAI 统一的 `finish_reason` (例如 `"stop"`) 并宣告流结束。
-
----
-
-## 4. 动态发现与缓存同步算法
-
-为保证模型列表的实时性，服务未采用静态写死的方式，而是设计了一套**动态拉取 + 1小时 TTL 缓存储存**机制：
+### 3.1 模型列表请求
 
 ```text
-               ┌───────────────────────┐
-               │    Get Models Req     │
-               └───────────┬───────────┘
-                           │
-                 [Cache Hit & Valid?]
-                  /             \
-                YES              NO
-                /                 \
-     ┌───────────────────┐    ┌───────────────────────────────┐
-     │ Return from Cache │    │ Fetch From OpenCode Zen API   │
-     └───────────────────┘    └───────────────┬───────────────┘
-                                              │
-                                       [Fetch Success?]
-                                       /              \
-                                     YES               NO
-                                     /                  \
-                        ┌──────────────────┐      ┌─────────────────────────┐
-                        │ Parse Free List  │      │ Catch Error & Log       │
-                        │ & Update Cache   │      │ Fallback to Static List │
-                        └──────────────────┘      └─────────────────────────┘
+Client
+  │
+  │ GET /v1/models
+  ▼
+routes/models.js
+  │
+  │ getFreeModels()
+  ▼
+config.js
+  │
+  ├─ cache hit  ─────────────► return cached OpenAI model list
+  │
+  └─ cache miss
+        │
+        ▼
+    fetch https://opencode.ai/zen/v1/models
+        │
+        ├─ success ─► filter free models ─► update 1h cache ─► return
+        │
+        └─ failure ─► return STATIC_FALLBACK_MODELS
 ```
 
-1. **缓存判定**：每次访问 `/v1/models` 时，系统先检测当前内存中是否已有缓存以及缓存是否已存活超过 1 小时。
-2. **过滤模型**：当发起请求且请求成功时，从官方的 40+ 模型中，只筛选出模型 ID 包含 `-free` 后缀以及已被标记为免费的隐身测试模型。
-3. **安全降级**：若发生网络超时或获取失败，自动捕获异常并加载项目内置的静态兜底列表（`STATIC_FALLBACK_MODELS`），从而最大限度保证服务接口的可用性与容错能力。
+### 3.2 聊天补全请求
+
+```text
+Client
+  │
+  │ POST /v1/chat/completions
+  ▼
+routes/chat.js
+  │
+  ├─ validate requested model
+  ├─ create AbortController
+  ├─ bind res.on("close") to abort upstream fetch
+  │
+  ▼
+executor.js
+  │
+  ├─ resolve upstream endpoint by model/protocol
+  ├─ normalize request payload if needed
+  ├─ fetch OpenCode Zen API
+  └─ normalize response chunks/body back to OpenAI format
+```
 
 ---
 
-## 5. 高并发连接释放与 Abort 传播机制
+## 4. 上游 API 访问特征
 
-在高并发场景下，如果客户端不断发起请求并迅速中途关闭，服务器的 CPU、套接字（Socket）和内存很容易因为挂起连接而耗尽。`opencodeapi` 通过在路由控制器和底层 Fetch 中构建中断传播链解决了此问题：
+服务访问 OpenCode 上游时会模拟 OpenCode 客户端的公共请求通道。
 
-1. **精确监听响应生命周期**：
-   在 Express 的流处理器中，我们监听了 `res.on("close")` 事件。此事件在连接完全终止、客户端主动取消或网络异常中断时可靠触发。
-2. **中止请求传播**：
-   当 `close` 事件捕获到客户端断开后，立刻调用内部的 `abortController.abort()`。
-3. **上游 Fetch 级联中止**：
-   我们在底层使用支持标准的 `AbortSignal` 的 `fetch`，当 `abortController` 被激活时，上游尚未完成的 `fetch` 连接会被强制关闭（Cloudflare 和 OpenCode 端的连接会被直接 Reset 并释放端口）。
-4. **中断流读取循环**：
-   在 while 循环的顶部设置检查点 `if (abortController.signal.aborted) break;`。在读取发生异常前优雅退出循环并释放 Reader 内存。
+关键请求特征：
 
-这套逻辑不仅消除了僵尸连接，还极大减少了在不稳定网络下的带宽占用，保证了其生产级别的吞吐性能。
+| 项目 | 值 |
+|---|---|
+| Base URL | `https://opencode.ai` |
+| Chat endpoint | `/zen/v1/chat/completions` |
+| Messages endpoint | `/zen/v1/messages` |
+| Models endpoint | `/zen/v1/models` |
+| Authorization | `Bearer public` |
+| Client header | `x-opencode-client: desktop` |
+| Streaming Accept | `text/event-stream` |
+
+这些 Header 和 endpoint 统一由 `src/config.js` 维护，避免在业务路由中重复硬编码。
+
+---
+
+## 5. 模型发现与过滤策略
+
+服务不会只依赖静态模型清单，而是优先动态获取 OpenCode 云端模型列表。
+
+### 5.1 缓存策略
+
+- 缓存位置：进程内存。
+- 缓存有效期：1 小时。
+- 缓存对象：过滤后的免费模型列表。
+- 失效条件：当前时间超过 `lastFetchTime + CACHE_TTL`。
+
+### 5.2 免费模型过滤
+
+当前逻辑会保留：
+
+1. 模型 ID 包含 `-free` 的模型。
+2. 已确认可通过公共通道访问的隐藏/测试免费模型，例如：
+   - `big-pickle`
+   - `grok-code`
+   - `gpt-5-nano`
+
+### 5.3 Fallback 策略
+
+当 `/zen/v1/models` 请求失败时，服务会返回 `STATIC_FALLBACK_MODELS`，避免 `/v1/models` 直接不可用。
+
+这类失败包括：
+
+- DNS 解析失败。
+- 上游短暂不可用。
+- 网络超时。
+- 上游返回非预期结构。
+
+---
+
+## 6. 协议适配层
+
+OpenCode 后端可能对不同模型使用不同接口协议。`opencodeapi` 的外部接口始终保持 OpenAI-compatible，由 `executor.js` 在内部做转换。
+
+### 6.1 OpenAI Chat Completions 路径
+
+大多数模型使用：
+
+```text
+POST https://opencode.ai/zen/v1/chat/completions
+```
+
+该路径与 OpenAI Chat Completions 结构接近，因此主要做透传与错误规范化。
+
+### 6.2 Anthropic Messages 路径
+
+部分模型使用：
+
+```text
+POST https://opencode.ai/zen/v1/messages
+```
+
+这类模型需要额外转换。
+
+请求转换重点：
+
+- 将 OpenAI `messages` 转为 Anthropic `messages`。
+- 处理 `system` 消息位置差异。
+- 将复杂 content block 合并为文本。
+- 自动补充 `max_tokens`。
+
+流式响应转换重点：
+
+| Anthropic SSE 事件 | OpenAI SSE 转换 |
+|---|---|
+| `message_start` | 初始化 `chat.completion.chunk` |
+| `content_block_delta` | 转成 `choices[0].delta.content` |
+| `message_delta` | 转成带 `finish_reason` 的 chunk |
+| `message_stop` | 输出 `data: [DONE]` |
+
+---
+
+## 7. SSE 流式转发与连接中止
+
+流式请求使用 SSE：
+
+```text
+Content-Type: text/event-stream
+Cache-Control: no-cache
+Connection: keep-alive
+```
+
+### 7.1 为什么监听 `res.on("close")`
+
+服务端需要知道客户端何时真正断开连接。实践中，监听 `req.on("close")` 可能在请求体读取完成后过早触发，尤其是 Express + JSON body parser 场景。因此本项目使用：
+
+```js
+res.on("close", () => {
+  abortController.abort();
+});
+```
+
+`res` 的 close 更能代表响应通道已关闭，适合用于 SSE 生命周期管理。
+
+### 7.2 Abort 传播链
+
+```text
+Client disconnect
+  │
+  ▼
+res close event
+  │
+  ▼
+AbortController.abort()
+  │
+  ▼
+fetch(..., { signal })
+  │
+  ▼
+upstream connection cancelled
+```
+
+这样可以避免：
+
+- 客户端已断开但上游仍在生成。
+- 服务器维持无效 socket。
+- 并发测试时产生大量僵尸连接。
+- 不必要的上游带宽消耗。
+
+---
+
+## 8. Docker 镜像构建
+
+项目提供 `Dockerfile`：
+
+```dockerfile
+FROM oven/bun:alpine AS base
+WORKDIR /app
+
+COPY package.json bun.lock ./
+RUN bun install --production
+
+COPY index.js ./
+COPY src/ ./src/
+
+EXPOSE 4097
+ENV PORT=4097
+ENV NODE_ENV=production
+
+CMD ["bun", "run", "index.js"]
+```
+
+构建本地镜像：
+
+```bash
+docker build -t zqbxdev/opencodeapi:local .
+```
+
+本地运行：
+
+```bash
+docker run --rm -p 4097:4097 zqbxdev/opencodeapi:local
+```
+
+---
+
+## 9. GitHub Actions 镜像发布链路
+
+工作流文件：
+
+```text
+.github/workflows/docker-publish.yml
+```
+
+触发条件：
+
+```yaml
+on:
+  push:
+    tags:
+      - '*'
+```
+
+也就是说：**只有推送 Git tag 时才会触发 Docker 镜像构建与推送**。
+
+### 9.1 发布流程
+
+```text
+Developer pushes tag
+  │
+  ▼
+GitHub Actions: Publish Docker Image
+  │
+  ├─ checkout code
+  ├─ setup QEMU
+  ├─ setup Docker Buildx
+  ├─ docker/login-action login to Docker Hub
+  ├─ docker/metadata-action generate image tags
+  └─ docker/build-push-action build and push image
+```
+
+### 9.2 Docker Hub Secrets
+
+该 workflow 使用 GitHub Repository Secrets 登录 Docker Hub：
+
+```yaml
+username: ${{ secrets.DOCKER_USERNAME }}
+password: ${{ secrets.DOCKER_PASSWORD }}
+```
+
+必须在 GitHub 仓库中配置：
+
+| Secret | 用途 |
+|---|---|
+| `DOCKER_USERNAME` | Docker Hub 用户名，例如 `zqbxdev` |
+| `DOCKER_PASSWORD` | Docker Hub Access Token |
+
+推荐使用 Docker Hub Access Token，而不是账户密码。
+
+配置路径：
+
+```text
+GitHub Repository
+→ Settings
+→ Secrets and variables
+→ Actions
+→ Repository secrets
+```
+
+Docker Hub token 创建路径：
+
+```text
+Docker Hub
+→ Account Settings
+→ Security
+→ New Access Token
+```
+
+### 9.3 生成的镜像标签
+
+workflow 通过 `docker/metadata-action` 生成：
+
+```yaml
+tags: |
+  type=ref,event=tag
+  type=raw,value=latest
+```
+
+例如推送：
+
+```text
+v1.0.0
+```
+
+会生成并推送：
+
+```text
+zqbxdev/opencodeapi:v1.0.0
+zqbxdev/opencodeapi:latest
+```
+
+### 9.4 重新触发失败的 tag 构建
+
+如果第一次构建失败，例如 Docker Hub secrets 没有配置，可以删除并重新推送同一个 tag：
+
+```bash
+git tag -d v1.0.0
+git push origin :refs/tags/v1.0.0
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+也可以直接发布新 tag：
+
+```bash
+git tag v1.0.1
+git push origin v1.0.1
+```
+
+---
+
+## 10. 运行时配置
+
+当前服务主要通过环境变量控制端口：
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `PORT` | `4097` | HTTP 服务监听端口 |
+| `NODE_ENV` | `production` in Docker | 运行环境标识 |
+
+Docker 中默认设置：
+
+```text
+PORT=4097
+NODE_ENV=production
+```
+
+---
+
+## 11. 维护建议
+
+1. **保持 workflow secrets 最小权限**：Docker Hub token 建议只用于当前镜像仓库的 Read/Write。
+2. **发布版本使用语义化 tag**：例如 `v1.0.0`、`v1.0.1`。
+3. **修改上游协议适配时必须跑压测**：至少运行 `bun run test-stress.js`。
+4. **新增特殊模型时更新过滤与协议映射**：如果模型不是标准 Chat Completions 协议，需要在 `executor.js` 中加入转换逻辑。
+5. **避免无意义高并发滥用上游公共通道**：服务适合自用与测试，不应用于批量刷量或商业转售。
+
+---
+
+## 12. 故障排查
+
+### Docker workflow: Username and password required
+
+说明 GitHub Secrets 未配置或名称不匹配。检查：
+
+```text
+DOCKER_USERNAME
+DOCKER_PASSWORD
+```
+
+### Docker workflow: denied: requested access to the resource is denied
+
+常见原因：
+
+1. Docker Hub token 权限不足。
+2. Docker Hub 仓库不存在或不属于该账号。
+3. `images:` 配置与 Docker Hub namespace 不一致。
+
+当前目标镜像：
+
+```text
+zqbxdev/opencodeapi
+```
+
+### Workflow 没有触发
+
+确认推送的是 tag，而不是普通 commit：
+
+```bash
+git tag v1.0.1
+git push origin v1.0.1
+```
+
+### SSE 请求很快结束
+
+检查客户端是否支持 SSE，并确认请求体包含：
+
+```json
+"stream": true
+```
+
+### 模型不可用
+
+先调用：
+
+```bash
+curl http://localhost:4097/v1/models
+```
+
+确认模型是否在当前动态列表或 fallback 列表中。
